@@ -3,72 +3,42 @@
             ["react-dom" :as react-dom]
             [clojure.string :as string]))
 
-(def ^:private fn-cache-prop
-  "$TsersComponentCache")
+(def ^:private component-cache-prop
+  (js/Symbol "CachedComponent"))
+
+; cache for parsed keyword tags
+(def ^:private tag-cache
+  (js/Map.))
+
+; cache for camelized keyword props
+(def ^:private prop-cache
+  (js/Map.))
 
 (defn- throw-ex [msg]
   (throw (js/Error. msg)))
 
-(def ^:private react-create-element
-  react/createElement)
-
-(def ^:private react-render
-  react-dom/render)
-
-(def ^:private react-memo
-  react/memo)
-
-(def ^:private react-use-state
-  react/useState)
+(def ^:private react-render react-dom/render)
+(def ^:private react-create-element react/createElement)
+(def ^:private react-memo react/memo)
+(def ^:private react-use-state react/useState)
 
 (declare as-elem)
 (declare as-js-props)
 
-(def ^:private tag-cache
-  (js/Map.))
-
-(defn- create-element [type props children]
-  (let [n (count children)]
-    (cond
-      (identical? 0 n)
-      (react-create-element type props)
-      (identical? 1 n)
-      (let [[c1 c2] children]
-        (react-create-element type props c1))
-      (identical? 2 n)
-      (let [[c1 c2] children]
-        (react-create-element type props c1 c2))
-      (identical? 3 n)
-      (let [[c1 c2 c3] children]
-        (react-create-element type props c1 c2 c3))
-      (identical? 4 n)
-      (let [[c1 c2 c3 c4] children]
-        (react-create-element type props c1 c2 c3 c4))
-      (identical? 5 n)
-      (let [[c1 c2 c3 c4 c5] children]
-        (react-create-element type props c1 c2 c3 c4 c5))
-      (identical? 6 n)
-      (let [[c1 c2 c3 c4 c5 c6] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6))
-      (identical? 7 n)
-      (let [[c1 c2 c3 c4 c5 c6 c7] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6 c7))
-      (identical? 8 n)
-      (let [[c1 c2 c3 c4 c5 c6 c7 c8] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6 c7 c8))
-      (identical? 9 n)
-      (let [[c1 c2 c3 c4 c5 c6 c7 c8 c9] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6 c7 c8 c9))
-      (identical? 10 n)
-      (let [[c1 c2 c3 c4 c5 c6 c7 c8 c9 c10] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6 c7 c8 c9 c10))
-      (identical? 11 n)
-      (let [[c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11))
-      (identical? 12 n)
-      (let [[c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12] children]
-        (react-create-element type props c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12))
-      true (apply create-element (cons type (cons props children))))))
+; Flattens children to variadic form expected by React
+; and optimize some common cases
+(defn- $ [js-type js-props js-children]
+  (let [t js-type
+        p js-props
+        c js-children]
+    (case (alength c)
+      0 (react-create-element t p)
+      1 (react-create-element t p (aget c 0))
+      2 (react-create-element t p (aget c 0) (aget c 1))
+      3 (react-create-element t p (aget c 0) (aget c 1) (aget c 2))
+      4 (react-create-element t p (aget c 0) (aget c 1) (aget c 2) (aget c 3))
+      5 (react-create-element t p (aget c 0) (aget c 1) (aget c 2) (aget c 3) (aget c 4))
+      (.apply react-create-element nil (.concat #js [t p] c)))))
 
 (defn- fq-name [kw]
   (str (if-let [ns (namespace kw)]
@@ -88,48 +58,43 @@
     (throw-ex (str "Invalid hiccup tag - id declared twice: " tag))))
 
 (defn- parse-tag [tag]
-  (loop [length  (.-length tag)
-         start   0
-         index   0
-         name    nil
-         classes nil
-         id      nil
-         mode    :name]
-    (if (identical? index length)
-      (case mode
-        :name [tag nil nil]
-        :id [name (subs tag start) (as-class-list classes)]
-        :class [name id (as-class-list (cons (subs tag start) classes))]
-        nil)
-      (let [ch (unchecked-get tag index)
-            i' (inc index)]
-        (if (identical? ch ".")
-          (do (assert-tag-valid-at-mode-break tag start index)
+  (let [res #js {:name nil :id nil :classes nil}]
+    (loop [si   0
+           i    0
+           mode nil]
+      (let [ch (.charAt tag i)]
+        (if (or (identical? ch ".")
+                (identical? ch "#")
+                (identical? ch ""))
+          (do (assert (not= si i) (str "Invalid hiccup tag: " tag))
               (case mode
-                :name (recur length i' i' (subs tag 0 index) classes id :class)
-                :id (recur length i' i' name classes (subs tag start index) :class)
-                :class (recur length i' i' name (cons (subs tag start index) classes) id :class)
-                nil))
-          (if (identical? ch "#")
-            (do (assert-no-prev-id tag id)
-                (assert-tag-valid-at-mode-break tag start index)
-                (case mode
-                  :name (recur length i' i' (subs tag 0 index) classes id :id)
-                  :class (recur length i' i' name (cons (subs tag start index) classes) id :id)
-                  :id (assert-no-prev-id tag tag)))
-            (recur length start i' name classes id mode)))))))
+                "." (if-let [cls (.-classes res)]
+                      (.push cls (subs tag si i))
+                      (set! res -classes #js [(subs tag si i)]))
+                "#" (do (assert (nil? (.-id res)) (str "Invalid hiccup tag: " tag))
+                        (set! res -id (subs tag si i)))
+                (do (assert (nil? (.-name res)) (str "Invalid hiccup tag: " tag))
+                    (set! res -name (subs tag si i))))
+              (if (identical? ch "")
+                ['todo]
+                (recur (inc i) (inc i) ch)))
+          (recur si (inc i) mode))))
+    [(.-name res)
+     (.-id res)
+     (some-> (.-classes res) (.join " "))]))
 
-(defn- parse-tag-cached [tag]
-  (if-let [cached-result (.get tag-cache tag)]
-    cached-result
-    (let [res (parse-tag tag)]
-      (.set tag-cache res)
-      res)))
+(defn- parse-tag-cached [tag-kw]
+  (let [tag-s (name tag-kw)]
+    (if-let [cached-result (.get tag-cache tag-s)]
+      cached-result
+      (let [res (parse-tag tag-s)]
+        (.set tag-cache tag-s res)
+        res))))
 
 (defn- camelize [s]
   (let [res (.split s "-")
         n   (.-length res)
-        buf (js/Array. n)]
+        buf (make-array n)]
     (unchecked-set buf 0 (unchecked-get res 0))
     (loop [i 1]
       (when (< i n)
@@ -138,7 +103,13 @@
           (unchecked-set buf i camelized))))
     (.join buf "")))
 
-(declare as-js-props)
+(defn- camelize-cached [prop-kw]
+  (let [prop-s (name prop-kw)]
+    (if-let [cached-result (.get prop-cache prop-s)]
+      cached-result
+      (let [res (camelize prop-s)]
+        (.set prop-cache prop-s res)
+        res))))
 
 (defn- as-js-prop-value [x]
   (cond
@@ -164,77 +135,90 @@
       (doseq [[k v] props]
         (let [p (cond
                   (= :class k) "className"
-                  (keyword? k) (camelize (name k))
+                  (keyword? k) (camelize-cached k)
                   (string? k) k
                   :else (throw-ex (str "Invalid intrinsic property name" (pr-str k))))]
           (unchecked-set js-props p (as-js-prop-value v))))
       js-props)))
 
-(comment
-  (parse-tag-cached (name :div.foobar))
+(defn- as-elem-array [sequence]
+  (let [a #js []]
+    (doseq [x sequence]
+      (.push a (as-elem x)))
+    a))
 
-  (def x #js {:foo 123 :bar 123})
+; TODO CHECK SOME SANE KEYS?
+(defn- as-js-key [key]
+  (cond
+    (or (string? key)
+        (number? key)
+        (boolean? key)
+        (undefined? key)) key
+    (keyword? key) (fq-name key)
+    (satisfies? IPrintWithWriter key) (pr-str key)
+    true key))
 
-  (doseq [[k v] x]
-    (println k v))
-
-  (as-js-props {:foo 123 :bar 123 :lol [:bal {:foo "123"}]})
-  (camelize "on-close" 123)
-
-  (as-elem [:div.foo])
-
-  '-)
-
-(defn- assert-no-id-from-props [js-props]
-  (if (some? (unchecked-get js-props "id"))
-    (throw-ex "Intrinsic element id declared in both tag name and props")))
-
-(defn- as-intrinsic-elem [tag props children]
-  (let [[tag-name id class-names] (parse-tag-cached (name tag))
-        js-props (as-js-props props)]
+(defn- as-intrinsic-elem [[tag-name id class-names] key props children]
+  (let [js-props (as-js-props props)]
     (when (some? id)
-      (assert-no-id-from-props props)
+      (assert (nil? (unchecked-get js-props "id")) (str "Id defined twice for tag " tag-name))
       (unchecked-set js-props "id" id))
     (when (some? class-names)
       (if-let [class-names-from-props (unchecked-get js-props "className")]
         (unchecked-set js-props "className" (str class-names-from-props " " class-names))
         (unchecked-set js-props "className" class-names)))
-    (create-element tag-name js-props (map as-elem children))))
+    (when (some? key)
+      (unchecked-set js-props "key" (as-js-key key)))
+    ($ tag-name js-props (as-elem-array children))))
 
-(defn- memo-eq [prev next]
-  (and (= (unchecked-get prev "p")
-          (unchecked-get next "p"))
-       (= (unchecked-get prev "c")
-          (unchecked-get next "c"))))
+(defn as-clj-props [react-props]
+  (let [children (unchecked-get react-props "c")
+        props    (or (unchecked-get react-props "p") {})]
+    (assoc props :children children)))
 
-(defn- as-component-elem [render-fn props children]
-  (let [comp (or (unchecked-get render-fn fn-cache-prop)
-                 (let [new-comp  (fn [react-props]
-                                   (let [props (unchecked-get react-props "p")
-                                         ch    (unchecked-get react-props "c")]
-                                     (-> (render-fn (assoc (or props {}) :children ch))
-                                         (as-elem))))
-                       memo-comp (react-memo new-comp memo-eq)]
-                   (unchecked-set memo-comp "displayName" (.-name render-fn))
-                   (unchecked-set new-comp "displayName" "fn")
-                   (unchecked-set render-fn fn-cache-prop memo-comp)
-                   memo-comp))]
-    (create-element comp #js {:p props :c children} [])))
+(defn- wrap-memo [comp eq]
+  {:pre [(or (false? eq)
+             (fn? eq))]}
+  (if (fn? eq)
+    (react-memo comp #(eq (as-clj-props %1) (as-clj-props %2)))
+    comp))
 
-(defn- vec-as-elem [[tag & [props & children :as props+children]]]
+(defn- with-display-name! [comp name]
+  (unchecked-set comp "displayName" name)
+  comp)
+
+(defn- as-component-elem [render-fn key props children]
+  (let [comp     (or (unchecked-get render-fn component-cache-prop)
+                     (let [fn-name  (.-name render-fn)
+                           wrapper  (-> (fn [react-props]
+                                          (-> (as-clj-props react-props)
+                                              (render-fn)
+                                              (as-elem)))
+                                        (with-display-name! fn-name))
+                           eq       (if-some [meta-eq (:memo (meta render-fn))]
+                                      meta-eq
+                                      =)
+                           new-comp (-> (wrap-memo wrapper eq)
+                                        (with-display-name! (str "memo(" fn-name ")")))]
+                       (unchecked-set render-fn component-cache-prop new-comp)
+                       new-comp))
+        js-props (if (some? key)
+                   #js {:p props :c children :key (as-js-key key)}
+                   #js {:p props :c children})
+        js-ch    #js []]
+    ($ comp js-props js-ch)))
+
+(defn- vec-as-elem [[tag & [props & children :as props+children] :as elem]]
   (let [props    (if (map? props)
                    props)
-        children (if props children props+children)]
+        children (if props children props+children)
+        key      (meta elem)]
     (cond
-      (keyword? tag) (as-intrinsic-elem tag props children)
-      (fn? tag) (as-component-elem tag props children)
-      (ifn? tag) (as-component-elem tag props children))))
-
-(defn- expand-to-array [sequence]
-  (let [a #js []]
-    (doseq [x sequence]
-      (.push a (as-elem x)))
-    a))
+      (keyword? tag) (as-intrinsic-elem (parse-tag-cached tag) key props children)
+      (or (fn? tag)
+          (ifn? tag)) (as-component-elem tag key props children)
+      (string? tag) (as-intrinsic-elem (parse-tag tag) key props children)
+      true (throw-ex (str "Invalid hiccup tag type: " (type tag))))))
 
 (defn- as-elem [x]
   (cond
@@ -244,17 +228,18 @@
         (number? x)
         (nil? x)
         (undefined? x)) x
-    (seq? x) (expand-to-array x)
+    (seq? x) (as-elem-array x)
     (keyword? x) (fq-name x)
-    :else (throw-ex (str "Invalid hiccup" (pr-str x)))))
+    true x))
 
 
+;;
+;; Public APIs
+;;
 
-
-
-(defn render [app node]
-  (-> (as-elem app)
-      (react-render node)))
+(defn render [hiccup dom-node]
+  (-> (as-elem hiccup)
+      (react-render dom-node)))
 
 (defn use-state [initial]
   (vec (react-use-state initial)))
