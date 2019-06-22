@@ -1,7 +1,8 @@
 (ns tsers.react
   (:require ["react" :as react]
             ["react-dom" :as react-dom]
-            [clojure.string :as string]))
+            [clojure.string :as string]
+            [goog.object :as gobj]))
 
 (def ^:private component-cache-prop
   (js/Symbol "CachedComponent"))
@@ -21,6 +22,7 @@
 (def ^:private react-create-element react/createElement)
 (def ^:private react-create-context react/createContext)
 (def ^:private react-fragment react/Fragment)
+(def ^:private react-suspense react/Suspense)
 (def ^:private react-memo react/memo)
 (def ^:private react-use-state react/useState)
 (def ^:private react-use-effect react/useEffect)
@@ -257,14 +259,8 @@
 
 (defn- as-react-deps [deps]
   (->> (map #(cond
-               (or (string? %)
-                   (number? %)
-                   (boolean? %)
-                   (fn? %)
-                   (undefined? %)
-                   (nil? %)) %
-               (keyword? %) (hash %)
-               (implements? IHash %) (hash %)
+               (keyword? %) (fq-name %)
+               (coll? %) (hash %)
                true %)
             deps)
        (into-array)))
@@ -277,6 +273,27 @@
         (ifn? res) #(res)
         true js/undefined))))
 
+(def ErrorBoundary
+  (let [impl #js {:componentDidCatch
+                  (fn [err info]
+                    (let [this     (js-this)
+                          on-error (.. this -props -onError)]
+                      (on-error err info)
+                      (.setState this #js {:latestError err})))
+                  :shouldComponentUpdate
+                  (fn [next-props _]
+                    (not (identical? (.-props (js-this)) next-props)))
+                  :render
+                  (fn [] (.. (js-this) -props -children))}
+        ctor (fn [props ctx]
+               (let [this (js-this)]
+                 (.call react/Component this props ctx)
+                 (unchecked-set this "__caughtError" nil)))]
+    (gobj/extend (.-prototype ctor) (.-prototype react/Component) impl)
+    (set! (.-displayName ctor) "ErrorBoundary")
+    (set! (.. ctor -prototype -constructor) ctor)
+    ctor))
+
 ;;
 ;; Public APIs
 ;;
@@ -286,6 +303,21 @@
    still memoize individual components by using `with-memo`."
   []
   (reset! default-memo-fn false))
+
+(defn with-memo
+  "By default, all components are wrapped with `React.memo` using `=` as an
+   equality operator.
+
+   You can override the equality operator or disable memoization by using
+   this function and providing a custom equality function or `false` as
+   a second argument.
+
+   You can also disable memoization by using `disable-memo!`.
+  "
+  ([component memo]
+   {:pre [(or (fn? memo)
+              (false? memo))]}
+   (with-meta component {:memo memo})))
 
 (defn render
   "Renders the given hiccup using the given dom node as a root
@@ -361,14 +393,26 @@
   [& children]
   ($ react-fragment #js {} (as-elem-array children)))
 
+(def ^{:doc "Wrapper for `React.Suspense`.
+
+   ```cljs
+   [suspense {:fallback [:div \"Loading...\"]}
+     [my-app]]
+   ```"} suspense
+  (-> (fn [{:keys [fallback children]}]
+        (let [props #js {:fallback (some-> fallback (as-element))}
+              ch    (as-elem-array children)]
+          ($ react-suspense props ch)))
+      (with-memo false)
+      (with-display-name! "suspense")))
+
 (defn create-context
   "Creates a new React Context with the given default value. See
    https://reactjs.org/docs/context.html for more details."
   [default-value]
   (react-create-context default-value))
 
-(defn context-provider
-  "Provides context to the rendered sub-tree, see https://reactjs.org/docs/context.html#contextprovider
+(def ^{:doc "Provides context to the rendered sub-tree, see https://reactjs.org/docs/context.html#contextprovider
    for more details.
 
    The usage of `context-provider` differs from React's `Context.Provider`
@@ -385,27 +429,24 @@
        [main]
        [footer]])
    ```
-  "
-  [{:keys [context value children]}]
-  {:pre [(some? context)
-         (.-Provider context)]}
-  (let [provider (.-Provider context)]
-    ($ provider #js {:value value} (as-elem-array children))))
+  "} context-provider
+  (-> (fn [{:keys [context value children]}]
+        {:pre [(some? context)
+               (.-Provider context)]}
+        (let [provider (.-Provider context)]
+          ($ provider #js {:value value} (as-elem-array children))))
+      (with-memo false)
+      (with-display-name! "context_provider")))
 
-(defn with-memo
-  "By default, all components are wrapped with `React.memo` using `=` as an
-   equality operator.
+(def ^{:doc "Wraps the given sub-tree with an error boundary
+  which triggers `:on-error` callback every time when an error
+  occurs in the subtree.
 
-   You can override the equality operator or disable memoization by using
-   this function and providing a custom equality function or `false` as
-   a second argument.
-
-   You can also disable memoization by using `disable-memo!`.
-  "
-  ([component memo]
-   {:pre [(or (fn? memo)
-              (false? memo))]}
-   (with-meta component {:memo memo})))
+  See https://reactjs.org/docs/error-boundaries.html for more details.
+  "} error-boundary
+  (fn [{:keys [on-error children]}]
+    {:pre [(fn? on-error)]}
+    ($ ErrorBoundary #js {:onError on-error} (as-elem-array children))))
 
 (defn use-state
   "Wrapper for useState hook, see https://reactjs.org/docs/hooks-reference.html#usestate
