@@ -22,7 +22,20 @@
 (def ^:private react-memo react/memo)
 (def ^:private react-use-state react/useState)
 
-(declare as-elem)
+(defn- native-react-type? [x]
+  (or (string? x)
+      (fn? x)
+      (instance? react/Component x)))
+
+(def ^:private obj-proto-to-string
+  (.. js/Object -prototype -toString))
+
+(defn- plain-object? [x]
+  (and (goog/isObject x)
+       (identical? (.-constructor x) js/Object)
+       (identical? (.call obj-proto-to-string x) "[object Object]")))
+
+(declare as-element)
 (declare as-js-props)
 
 ; Flattens children to variadic form expected by React
@@ -44,6 +57,14 @@
   (str (if-let [ns (namespace kw)]
          (str ns "/"))
        (name kw)))
+
+(defn- display-name [comp]
+  (or (.-displayName comp)
+      (.-name comp)))
+
+(defn- with-display-name! [comp name]
+  (set! comp -displayName name)
+  comp)
 
 (defn- as-class-list [classes]
   (if-not (nil? classes)
@@ -126,6 +147,7 @@
                   (.push val (as-js-prop-value v)))
                 val)
     (ifn? x) (fn [& args] (apply x args))
+    (satisfies? IPrintWithWriter key) (pr-str key)
     :else x))
 
 (defn- as-js-props [props]
@@ -144,10 +166,9 @@
 (defn- as-elem-array [sequence]
   (let [a #js []]
     (doseq [x sequence]
-      (.push a (as-elem x)))
+      (.push a (as-element x)))
     a))
 
-; TODO CHECK SOME SANE KEYS?
 (defn- as-js-key [key]
   (cond
     (or (string? key)
@@ -159,7 +180,7 @@
     true key))
 
 (defn- as-intrinsic-elem [[tag-name id class-names] key props children]
-  (let [js-props (as-js-props props)]
+  (let [js-props (as-js-props (if (some? key) (assoc props :key key) props))]
     (when (some? id)
       (assert (nil? (unchecked-get js-props "id")) (str "Id defined twice for tag " tag-name))
       (unchecked-set js-props "id" id))
@@ -167,46 +188,32 @@
       (if-let [class-names-from-props (unchecked-get js-props "className")]
         (unchecked-set js-props "className" (str class-names-from-props " " class-names))
         (unchecked-set js-props "className" class-names)))
-    (when (some? key)
-      (unchecked-set js-props "key" (as-js-key key)))
     ($ tag-name js-props (as-elem-array children))))
 
-(defn as-clj-props [react-props]
-  (let [children (unchecked-get react-props "c")
-        props    (or (unchecked-get react-props "p") {})]
+(defn- unwrap-props [wrapped-props]
+  (let [children (unchecked-get wrapped-props "c")
+        props    (or (unchecked-get wrapped-props "p") {})]
     (assoc props :children children)))
 
-(defn- wrap-memo [comp eq]
-  {:pre [(or (false? eq)
-             (fn? eq))]}
-  (if (fn? eq)
-    (react-memo comp #(eq (as-clj-props %1) (as-clj-props %2)))
-    comp))
-
-(defn- with-display-name! [comp name]
-  (unchecked-set comp "displayName" name)
-  comp)
+(defn- wrap-props [key props children]
+  (if (some? key)
+    #js {:p props :c children :key (as-js-key key)}
+    #js {:p props :c children}))
 
 (defn- as-component-elem [render-fn key props children]
-  (let [comp     (or (unchecked-get render-fn component-cache-prop)
-                     (let [fn-name  (.-name render-fn)
-                           wrapper  (-> (fn [react-props]
-                                          (-> (as-clj-props react-props)
-                                              (render-fn)
-                                              (as-elem)))
-                                        (with-display-name! fn-name))
-                           eq       (if-some [meta-eq (:memo (meta render-fn))]
-                                      meta-eq
-                                      =)
-                           new-comp (-> (wrap-memo wrapper eq)
-                                        (with-display-name! (str "memo(" fn-name ")")))]
-                       (unchecked-set render-fn component-cache-prop new-comp)
-                       new-comp))
-        js-props (if (some? key)
-                   #js {:p props :c children :key (as-js-key key)}
-                   #js {:p props :c children})
-        js-ch    #js []]
-    ($ comp js-props js-ch)))
+  (let [comp (or (unchecked-get render-fn component-cache-prop)
+                 (let [wrapper  (-> (fn [react-props]
+                                      (-> (unwrap-props react-props)
+                                          (render-fn)
+                                          (as-element)))
+                                    (with-display-name! (display-name render-fn)))
+                       new-comp (if-some [eq (:memo (meta render-fn))]
+                                  (-> (react-memo wrapper #(eq (unwrap-props %1) (unwrap-props %2)))
+                                      (with-display-name! (str "memo(" (display-name render-fn) ")")))
+                                  wrapper)]
+                   (unchecked-set render-fn component-cache-prop new-comp)
+                   new-comp))]
+    ($ comp (wrap-props key props children) #js [])))
 
 (defn- vec-as-elem [[tag & [props & children :as props+children] :as elem]]
   (let [props    (if (map? props)
@@ -220,26 +227,91 @@
       (string? tag) (as-intrinsic-elem (parse-tag tag) key props children)
       true (throw-ex (str "Invalid hiccup tag type: " (type tag))))))
 
-(defn- as-elem [x]
-  (cond
-    (vector? x) (vec-as-elem x)
-    (or (boolean? x)
-        (string? x)
-        (number? x)
-        (nil? x)
-        (undefined? x)) x
-    (seq? x) (as-elem-array x)
-    (keyword? x) (fq-name x)
-    true x))
-
-
 ;;
 ;; Public APIs
 ;;
 
-(defn render [hiccup dom-node]
-  (-> (as-elem hiccup)
+(defn render
+  "Renders the given hiccup using the given dom node as a root
+   for the rendered tree"
+  [hiccup dom-node]
+  (-> (as-element hiccup)
       (react-render dom-node)))
 
-(defn use-state [initial]
-  (vec (react-use-state initial)))
+(defn as-element
+  "Turns the given hiccup into React element(s) recursively, for example:
+
+   ```cljs
+   (def app-el
+     (as-element [:div.app
+                   [sidebar {:version 123 :title \"tsers\"]
+                   [main {}]]))
+   ```
+  "
+  [hiccup]
+  (cond
+    (vector? hiccup) (vec-as-elem hiccup)
+    (or (boolean? hiccup)
+        (string? hiccup)
+        (number? hiccup)
+        (nil? hiccup)
+        (undefined? hiccup)) hiccup
+    (seq? hiccup) (as-elem-array hiccup)
+    (keyword? hiccup) (fq-name hiccup)
+    true hiccup))
+
+(defn create-element
+  "Creates a native React element by calling React.createElement directly.
+
+   No cljs->js conversions are applied to the props and children so this means
+   that props (second argument) must be either plain JS object or nil and children
+   must be native React elements as well. Use `as-element` to convert children into
+   native elements.
+
+   This function is mainly needed for JS library interrop.
+
+   An example:
+   ```cljs
+   (require '[\"react-select\" :as react-select])
+
+   (defn select [{:keys [value on-change options]}]
+     (let [comp  react-select/default
+           props #js {:value    (clj->js value)
+                      :onChange (if on-change #(on-change (js->clj % :keywordize-keys true)))
+                      :options  (clj->js options)}]
+       (create-element comp props)))
+
+   (defn app [_]
+     (let [[selection set-selection!] (use-state nil)]
+       [:div
+        [:h1 \"Best programming language is: \" (or (:label selection) \"N/A\")]
+        [select {:value     (:value selection)
+                 :on-change set-selection!
+                 :options   [{:value \"js\"
+                              :label \"JavaScript\"}
+                             {:value \"cljs\"
+                              :label \"ClojureScript\"}]}]]))
+   ```
+   "
+  [type props & children]
+  {:pre [(native-react-type? type)
+         (or (nil? props)
+             (plain-object? props))]}
+  ($ type props (into-array children)))
+
+(defn memo
+  "Turns the given component to a React.Memo component. Uses `=` as a default
+   equality operator. This function works only with ClojureScript components,
+   for JS components, you must wrap them first with memoized ClojureScript
+   component.
+
+   See `create-element` for more details about JS interrop.
+  "
+  ([component eq]
+   {:pre [(fn? eq)]}
+   (with-meta component {:memo eq}))
+  ([component]
+   (memo component =)))
+
+(defn use-state [initial-state]
+  (vec (react-use-state initial-state)))
