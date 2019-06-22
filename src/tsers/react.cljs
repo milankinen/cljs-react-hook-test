@@ -1,4 +1,5 @@
 (ns tsers.react
+  (:require-macros [tsers.react])
   (:require ["react" :as react]
             ["react-dom" :as react-dom]
             [clojure.string :as string]
