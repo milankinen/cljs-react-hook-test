@@ -19,8 +19,19 @@
 
 (def ^:private react-render react-dom/render)
 (def ^:private react-create-element react/createElement)
+(def ^:private react-create-context react/createContext)
+(def ^:private react-fragment react/Fragment)
 (def ^:private react-memo react/memo)
 (def ^:private react-use-state react/useState)
+(def ^:private react-use-effect react/useEffect)
+(def ^:private react-use-context react/useContext)
+(def ^:private react-use-layout-effect react/useLayoutEffect)
+(def ^:private react-use-memo react/useMemo)
+(def ^:private react-use-callback react/useCallback)
+(def ^:private react-use-reducer react/useReducer)
+(def ^:private react-use-ref react/useRef)
+
+(defonce ^:private default-memo-fn (atom =))
 
 (defn- native-react-type? [x]
   (or (string? x)
@@ -37,6 +48,17 @@
 
 (declare as-element)
 (declare as-js-props)
+
+(defn- ref-atom [initial-value]
+  (let [a (atom initial-value)]
+    (assert (identical? js/undefined (.-current a)))
+    ; for React ref interrop
+    (js/Object.defineProperty
+      a
+      "current"
+      #js {:get (fn [] @a)
+           :set (fn [val] (reset! a val))})
+    a))
 
 ; Flattens children to variadic form expected by React
 ; and optimize some common cases
@@ -200,17 +222,22 @@
     #js {:p props :c children :key (as-js-key key)}
     #js {:p props :c children}))
 
+(defn- wrap-component [render-fn]
+  (let [wrapper (-> (fn [react-props]
+                      (-> (unwrap-props react-props)
+                          (render-fn)
+                          (as-element)))
+                    (with-display-name! (display-name render-fn)))
+        memo    (:memo (meta render-fn))
+        eq      (or memo @default-memo-fn)]
+    (if-not (false? memo)
+      (-> (react-memo wrapper #(eq (unwrap-props %1) (unwrap-props %2)))
+          (with-display-name! (str "memo(" (display-name render-fn) ")")))
+      wrapper)))
+
 (defn- as-component-elem [render-fn key props children]
   (let [comp (or (unchecked-get render-fn component-cache-prop)
-                 (let [wrapper  (-> (fn [react-props]
-                                      (-> (unwrap-props react-props)
-                                          (render-fn)
-                                          (as-element)))
-                                    (with-display-name! (display-name render-fn)))
-                       new-comp (if-some [eq (:memo (meta render-fn))]
-                                  (-> (react-memo wrapper #(eq (unwrap-props %1) (unwrap-props %2)))
-                                      (with-display-name! (str "memo(" (display-name render-fn) ")")))
-                                  wrapper)]
+                 (let [new-comp (wrap-component render-fn)]
                    (unchecked-set render-fn component-cache-prop new-comp)
                    new-comp))]
     ($ comp (wrap-props key props children) #js [])))
@@ -225,11 +252,40 @@
       (or (fn? tag)
           (ifn? tag)) (as-component-elem tag key props children)
       (string? tag) (as-intrinsic-elem (parse-tag tag) key props children)
+      (some? (.-$$typeof tag)) (as-component-elem tag key props children)
       true (throw-ex (str "Invalid hiccup tag type: " (type tag))))))
+
+(defn- as-react-deps [deps]
+  (->> (map #(cond
+               (or (string? %)
+                   (number? %)
+                   (boolean? %)
+                   (fn? %)
+                   (undefined? %)
+                   (nil? %)) %
+               (keyword? %) (hash %)
+               (implements? IHash %) (hash %)
+               true %)
+            deps)
+       (into-array)))
+
+(defn- wrap-effect-fn [eff]
+  (fn []
+    (let [res (eff)]
+      (cond
+        (fn? res) res
+        (ifn? res) #(res)
+        true js/undefined))))
 
 ;;
 ;; Public APIs
 ;;
+
+(defn disable-memo!
+  "Globally disables component memoization for all components. You can
+   still memoize individual components by using `with-memo`."
+  []
+  (reset! default-memo-fn false))
 
 (defn render
   "Renders the given hiccup using the given dom node as a root
@@ -275,11 +331,11 @@
    (require '[\"react-select\" :as react-select])
 
    (defn select [{:keys [value on-change options]}]
-     (let [comp  react-select/default
+     (let [type  react-select/default
            props #js {:value    (clj->js value)
                       :onChange (if on-change #(on-change (js->clj % :keywordize-keys true)))
                       :options  (clj->js options)}]
-       (create-element comp props)))
+       (create-element type props)))
 
    (defn app [_]
      (let [[selection set-selection!] (use-state nil)]
@@ -299,19 +355,149 @@
              (plain-object? props))]}
   ($ type props (into-array children)))
 
-(defn memo
-  "Turns the given component to a React.Memo component. Uses `=` as a default
-   equality operator. This function works only with ClojureScript components,
-   for JS components, you must wrap them first with memoized ClojureScript
-   component.
+(defn <>
+  "Creates a React Fragment with the given children. Children can be either
+   native React elements or hiccup elements."
+  [& children]
+  ($ react-fragment #js {} (as-elem-array children)))
 
-   See `create-element` for more details about JS interrop.
+(defn create-context
+  "Creates a new React Context with the given default value. See
+   https://reactjs.org/docs/context.html for more details."
+  [default-value]
+  (react-create-context default-value))
+
+(defn context-provider
+  "Provides context to the rendered sub-tree, see https://reactjs.org/docs/context.html#contextprovider
+   for more details.
+
+   The usage of `context-provider` differs from React's `Context.Provider`
+   in requiring the used context to be given as a `context` prop the the
+   provider along with context's `value`.
+
+   An example:
+   ```cljs
+   (def my-context (create-context 'some-default-value)
+
+   (defn my-app [_]
+     [context-provider {:context my-context :value '...}
+       [sidebar]
+       [main]
+       [footer]])
+   ```
   "
-  ([component eq]
-   {:pre [(fn? eq)]}
-   (with-meta component {:memo eq}))
-  ([component]
-   (memo component =)))
+  [{:keys [context value children]}]
+  {:pre [(some? context)
+         (.-Provider context)]}
+  (let [provider (.-Provider context)]
+    ($ provider #js {:value value} (as-elem-array children))))
 
-(defn use-state [initial-state]
+(defn with-memo
+  "By default, all components are wrapped with `React.memo` using `=` as an
+   equality operator.
+
+   You can override the equality operator or disable memoization by using
+   this function and providing a custom equality function or `false` as
+   a second argument.
+
+   You can also disable memoization by using `disable-memo!`.
+  "
+  ([component memo]
+   {:pre [(or (fn? memo)
+              (false? memo))]}
+   (with-meta component {:memo memo})))
+
+(defn use-state
+  "Wrapper for useState hook, see https://reactjs.org/docs/hooks-reference.html#usestate
+   for more details.
+
+   Returned value is a vector or `[state set-state]`
+  "
+  [initial-state]
   (vec (react-use-state initial-state)))
+
+(defn use-effect
+  "Wrapper for useEffect hook, see https://reactjs.org/docs/hooks-reference.html#useeffect
+   for more details.
+
+   Dependencies must be either a vector or `nil`. Use `[]` to run effect function
+   only once and `nil` to run it after every commit.
+  "
+  [eff deps]
+  {:pre [(or (nil? deps)
+             (vector? deps))
+         (or (fn? eff)
+             (ifn? eff))]}
+  (if (some? deps)
+    (react-use-effect (wrap-effect-fn eff) (as-react-deps deps))
+    (react-use-effect (wrap-effect-fn eff))))
+
+(defn use-context
+  "Wrapper for useContext, see https://reactjs.org/docs/hooks-reference.html#usecontext
+   for more details."
+  [context]
+  {:pre [(some? context)
+         (.-Provider context)]}
+  (react-use-context context))
+
+(defn use-layout-effect
+  "Wrapper for useLayoutEffect hook, see https://reactjs.org/docs/hooks-reference.html#uselayouteffect
+   for more details.
+
+   Dependencies must be either a vector or `nil`. Use `[]` to run effect function
+   only once and `nil` to run it after every commit."
+  [eff deps]
+  {:pre [(or (nil? deps)
+             (vector? deps))
+         (or (fn? eff)
+             (ifn? eff))]}
+  (if (some? deps)
+    (react-use-layout-effect (wrap-effect-fn eff) (as-react-deps deps))
+    (react-use-layout-effect (wrap-effect-fn eff))))
+
+(defn use-memo
+  "Wrapper for useMemo hook, see https://reactjs.org/docs/hooks-reference.html#usememo
+   for more details."
+  [value-fn deps]
+  {:pre [(fn? value-fn)
+         (vector? deps)]}
+  (react-use-memo value-fn (as-react-deps deps)))
+
+(defn use-callback
+  "Wrapper for useCallback hook, see https://reactjs.org/docs/hooks-reference.html#usecallback
+   for more details."
+  [callback-fn deps]
+  {:pre [(fn? callback-fn)
+         (vector? deps)]}
+  (react-use-callback callback-fn (as-react-deps deps)))
+
+(defn use-ref
+  "Wrapper for useRef hook, see https://reactjs.org/docs/hooks-reference.html#useref
+   for more details.
+
+   However, instead of plain JS object with `current` attribute, this function
+   returns an atom containing the current value of the ref.
+   "
+  [initial-value]
+  (let [ref (react-use-ref nil)]
+    (or (.-current ref)
+        (let [a (ref-atom initial-value)]
+          (set! (.-current ref) a)
+          a))))
+
+(defn use-reducer
+  "Wrapper for useReducer, see https://reactjs.org/docs/hooks-reference.html#usereducer
+   for more details.
+
+   Returned value is a vector or `[state dispatch]`
+  "
+  ([reducer initial-arg init]
+   {:pre [(fn? reducer)
+          (or (fn? init)
+              (nil? init))]}
+   (-> (if (fn? init)
+         (react-use-reducer reducer initial-arg init)
+         (react-use-reducer reducer initial-arg))
+       (vec)))
+  ([reducer initial-arg]
+   (use-reducer reducer initial-arg nil)))
